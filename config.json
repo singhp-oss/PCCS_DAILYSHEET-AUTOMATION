@@ -1,0 +1,17 @@
+{
+  "paths": {
+    "watch_folder"         : "D:\\MY DOWNLOADS",
+    "extract_excel"        : "C:\\AWB_TOOLS\\EXTRACT_EXCEL\\AWB_EXTRACT-DATA.xlsx",
+    "processed_folder"     : "C:\\AWB_TOOLS\\PROCESSED",
+    "blr_processed_folder" : "C:\\AWB_TOOLS\\PROCESSED_BLR",
+    "daily_sheet"          : "D:\\NEW_PC\\DAILY_WORKS\\PRADEEP_DAILYSHEET.xlsm"
+  },
+  "settings": {
+    "extract_sheet"        : "CCU",
+    "blr_extract_sheet"    : "BLR",
+    "daily_sheet_name"     : "ccu_2025-26",
+    "blr_sheet_name"       : "BLR-2025-26",
+    "macro_wait_sec"       : 0.6,
+    "flat_rate_threshold"  : 1000
+  }
+}
