@@ -1,9 +1,10 @@
 {
   "paths": {
-    "watch_folder"         : "D:\\MY DOWNLOADS",
+    "base_data_dir"        : "AUTO",
+    "watch_folder"         : "AUTO",
     "extract_excel"        : "C:\\AWB_TOOLS\\EXTRACT_EXCEL\\AWB_EXTRACT-DATA.xlsx",
-    "processed_folder"     : "C:\\AWB_TOOLS\\PROCESSED",
-    "blr_processed_folder" : "C:\\AWB_TOOLS\\PROCESSED_BLR",
+    "processed_folder"     : "AUTO",
+    "blr_processed_folder" : "AUTO",
     "daily_sheet"          : "D:\\NEW_PC\\DAILY_WORKS\\PRADEEP_DAILYSHEET.xlsm"
   },
   "settings": {
@@ -13,5 +14,48 @@
     "blr_sheet_name"       : "BLR-2025-26",
     "macro_wait_sec"       : 0.6,
     "flat_rate_threshold"  : 1000
+  },
+  "financial_year": {
+    "dynamic"              : true,
+    "start_month"          : 4,
+    "ccu_sheet_pattern"    : "ccu_{fy}",
+    "blr_sheet_pattern"    : "BLR-{fy}"
+  },
+  "cleanup": {
+    "enabled"              : true,
+    "interval_days"        : 7,
+    "archive_folder"       : "AUTO",
+    "trim_extract_rows"    : true,
+    "keep_recent_rows"     : 500
+  },
+  "column_maps": {
+    "CCU": {
+      "daily_awb_col"   : 2,
+      "daily_agent_col" : 12,
+      "rate_dest_col"   : 16,
+      "basic_col"       : 17,
+      "int_cols"        : [19],
+      "date_cols"       : [3],
+      "steps": {
+        "step1"    : [[6, 12]],
+        "step2"    : [[7, 13], [8, 14], [9, 15], [10, 16], [11, 18], [12, 19], [13, 32]],
+        "step3"    : [[1, 2], [2, 3], [3, 5], [4, 6]],
+        "step_last": [[5, 11]]
+      }
+    },
+    "BLR": {
+      "daily_awb_col"   : 2,
+      "daily_agent_col" : 10,
+      "rate_dest_col"   : 14,
+      "basic_col"       : 15,
+      "int_cols"        : [17],
+      "date_cols"       : [3],
+      "steps": {
+        "step1"    : [[1, 2]],
+        "step2"    : [[6, 10], [7, 11], [8, 12], [9, 13], [10, 14], [11, 16], [12, 17], [13, 33]],
+        "step3"    : [[2, 3], [3, 5], [4, 6]],
+        "step_last": [[5, 9]]
+      }
+    }
   }
 }

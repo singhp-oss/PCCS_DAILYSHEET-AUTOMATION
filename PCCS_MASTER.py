@@ -14,14 +14,25 @@ Install: pip install watchdog pypdf openpyxl pywin32 pystray Pillow
 Run    : python PCCS_MASTER.py  (ya START.bat)
 """
 
-import os, re, sys, json, time, shutil, glob, threading, queue
+import os, re, sys, json, time, shutil, glob, threading, queue, zipfile
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 import difflib
 import win32gui
 import win32con
-from datetime import datetime
+from datetime import datetime, timedelta
 from copy import copy
+
+# ── Console UTF-8 hardening ───────────────────────────────────────────────────
+# Windows console default cp1252 hai — humare print() mein ↓ → ✔ ✅ emojis hain.
+# Real console / Task Scheduler logging mein yeh UnicodeEncodeError se crash kar
+# sakta hai. stdout/stderr ko UTF-8 pe reconfigure karo (pythonw mein no-op).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ─── CONFIG LOAD ──────────────────────────────────────────────────────────────
 
@@ -40,9 +51,80 @@ def _resource(relative: str) -> str:
     """Bundled file ka sahi path — EXE ya normal script dono ke liye."""
     return os.path.join(BASE_DIR, relative)
 
+def _default_config_template() -> dict:
+    """
+    Full config schema ka default — setup wizard aur missing-block healing
+    dono isse use karte hain. Paths 'AUTO' = zero-config autodetect.
+    """
+    return {
+        "paths": {
+            "base_data_dir"        : "AUTO",
+            "watch_folder"         : "AUTO",
+            "extract_excel"        : "AUTO",
+            "processed_folder"     : "AUTO",
+            "blr_processed_folder" : "AUTO",
+            "daily_sheet"          : "AUTO",
+        },
+        "settings": {
+            "extract_sheet"        : "CCU",
+            "blr_extract_sheet"    : "BLR",
+            "daily_sheet_name"     : "ccu_2025-26",
+            "blr_sheet_name"       : "BLR-2025-26",
+            "macro_wait_sec"       : 0.6,
+            "flat_rate_threshold"  : 1000,
+        },
+        "financial_year": {
+            "dynamic"           : True,
+            "start_month"       : 4,
+            "ccu_sheet_pattern" : "ccu_{fy}",
+            "blr_sheet_pattern" : "BLR-{fy}",
+        },
+        "cleanup": {
+            "enabled"           : True,
+            "interval_days"     : 7,
+            "archive_folder"    : "AUTO",
+            "trim_extract_rows" : True,
+            "keep_recent_rows"  : 500,
+        },
+        "column_maps": {
+            "CCU": {
+                "daily_awb_col": 2, "daily_agent_col": 12,
+                "rate_dest_col": 16, "basic_col": 17,
+                "int_cols": [19], "date_cols": [3],
+                "steps": {
+                    "step1":     [[6, 12]],
+                    "step2":     [[7, 13], [8, 14], [9, 15], [10, 16], [11, 18], [12, 19], [13, 32]],
+                    "step3":     [[1, 2], [2, 3], [3, 5], [4, 6]],
+                    "step_last": [[5, 11]],
+                },
+            },
+            "BLR": {
+                "daily_awb_col": 2, "daily_agent_col": 10,
+                "rate_dest_col": 14, "basic_col": 15,
+                "int_cols": [17], "date_cols": [3],
+                "steps": {
+                    "step1":     [[1, 2]],
+                    "step2":     [[6, 10], [7, 11], [8, 12], [9, 13], [10, 14], [11, 16], [12, 17], [13, 33]],
+                    "step3":     [[2, 3], [3, 5], [4, 6]],
+                    "step_last": [[5, 9]],
+                },
+            },
+        },
+    }
+
 def load_config() -> dict:
+    """Config load + self-heal — purane config mein naye blocks auto-merge."""
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    # Backward-compat: missing top-level blocks default se bhar do (non-destructive)
+    tmpl = _default_config_template()
+    for key, default_block in tmpl.items():
+        if key not in cfg:
+            cfg[key] = default_block
+        elif isinstance(default_block, dict):
+            for sub_k, sub_v in default_block.items():
+                cfg[key].setdefault(sub_k, sub_v)
+    return cfg
 
 # ── Global config vars — _init_globals() se set honge ────────────────────────
 CFG = P = S = None
@@ -52,6 +134,84 @@ EXTRACT_SHEET = DAILY_SHEET_NAME = ""
 BLR_EXTRACT_SHEET = BLR_DAILY_SHEET = ""
 MACRO_WAIT = 1.0
 FLAT_RATE_LIMIT = 1000
+# ── New (upgrade) globals ────────────────────────────────────────────────────
+BASE_DATA_DIR = ARCHIVE_FOLDER = ""
+FY_CFG        = {}      # financial_year block
+CLEANUP_CFG   = {}      # cleanup block
+COLUMN_MAPS   = {}      # column_maps block (CCU / BLR)
+
+# ─── ZERO-CONFIG PATH RESOLUTION ──────────────────────────────────────────────
+
+def _downloads_folder() -> str:
+    """Windows/Any: user ka Downloads folder detect karo."""
+    home = os.path.expanduser("~")
+    dl   = os.path.join(home, "Downloads")
+    return dl
+
+def current_financial_year(start_month: int = 4) -> str:
+    """
+    Indian FY string, e.g. 2026-27.  FY April se March.
+    start_month=4 → 1 Apr 2026 se 31 Mar 2027 = '2026-27'.
+    Date.now() script mein available hai (yeh normal runtime hai).
+    """
+    now = datetime.now()
+    if now.month >= start_month:
+        y1 = now.year
+    else:
+        y1 = now.year - 1
+    return f"{y1}-{str(y1 + 1)[-2:]}"
+
+def _resolve_path(value: str, default: str) -> str:
+    """
+    'AUTO' ya khali → default use karo.
+    Relative path → BASE_DIR (project) ke relative absolute banao.
+    Absolute path → jaisa hai waisa.
+    """
+    if not value or str(value).strip().upper() == "AUTO":
+        return default
+    value = str(value).strip()
+    if os.path.isabs(value):
+        return value
+    return os.path.abspath(os.path.join(BASE_DIR, value))
+
+def ensure_dirs(*folders):
+    """Diye gaye folders create karo agar exist nahi karte."""
+    for f in folders:
+        if f:
+            try:
+                os.makedirs(f, exist_ok=True)
+            except Exception as e:
+                print(f"[DIRS] '{f}' create fail: {e}")
+
+def resolve_fy_sheet(origin: str, wb_daily=None) -> str:
+    """
+    Dynamic FY se sheet naam banao (config pattern se).
+    Safe fallback: agar dynamic off hai YA computed tab wb_daily mein exist
+    nahi karta, to config ka static naam wapas do.
+    wb_daily = win32com workbook (optional) — tab existence check ke liye.
+    """
+    static = BLR_DAILY_SHEET if origin == "BLR" else DAILY_SHEET_NAME
+    if not FY_CFG.get("dynamic", False):
+        return static
+    fy      = current_financial_year(int(FY_CFG.get("start_month", 4)))
+    pattern = FY_CFG.get("blr_sheet_pattern" if origin == "BLR"
+                         else "ccu_sheet_pattern", "")
+    if not pattern:
+        return static
+    computed = pattern.replace("{fy}", fy)
+    # Tab existence check — sirf tabhi jab workbook diya gaya ho
+    if wb_daily is not None:
+        try:
+            names = {sh.Name.strip().lower() for sh in wb_daily.Sheets}
+            if computed.strip().lower() not in names:
+                print(f"[FY] Computed tab '{computed}' nahi mila — "
+                      f"fallback '{static}' use kar raha hoon.")
+                return static
+        except Exception as e:
+            print(f"[FY] Tab check fail ({e}) — fallback '{static}'.")
+            return static
+    print(f"[FY] Origin {origin} → sheet '{computed}' (FY {fy})")
+    return computed
 
 def _init_globals():
     """Config.json se sab globals load karo — wizard ke baad bhi call hota hai."""
@@ -61,16 +221,34 @@ def _init_globals():
     global EXTRACT_SHEET, DAILY_SHEET_NAME, MACRO_WAIT, FLAT_RATE_LIMIT
     global BLR_EXTRACT_SHEET, BLR_DAILY_SHEET
     global AGENT_LIST_CCU, AGENT_LIST_BLR, AGENT_LIST
+    global BASE_DATA_DIR, ARCHIVE_FOLDER, FY_CFG, CLEANUP_CFG, COLUMN_MAPS
 
     CFG = load_config()
     P   = CFG["paths"]
     S   = CFG["settings"]
 
-    WATCH_FOLDER         = P["watch_folder"]
-    EXTRACT_PATH         = P["extract_excel"]
-    PROCESSED_FOLDER     = P["processed_folder"]
-    BLR_PROCESSED_FOLDER = P["blr_processed_folder"]
-    DAILY_PATH           = P["daily_sheet"]
+    # ── Extra config blocks (upgrade) — .get() se backward-compatible ─────────
+    FY_CFG      = CFG.get("financial_year", {})
+    CLEANUP_CFG = CFG.get("cleanup", {})
+    COLUMN_MAPS = CFG.get("column_maps", {})
+
+    # ── Zero-config base data dir — default: project ke andar AWB_TOOLS ───────
+    BASE_DATA_DIR = _resolve_path(P.get("base_data_dir", "AUTO"),
+                                  os.path.join(BASE_DIR, "AWB_TOOLS"))
+
+    WATCH_FOLDER         = _resolve_path(P.get("watch_folder", "AUTO"),
+                                         _downloads_folder())
+    EXTRACT_PATH         = _resolve_path(P.get("extract_excel", "AUTO"),
+                                         os.path.join(BASE_DATA_DIR, "AWB_EXTRACT-DATA.xlsx"))
+    PROCESSED_FOLDER     = _resolve_path(P.get("processed_folder", "AUTO"),
+                                         os.path.join(BASE_DATA_DIR, "PROCESSED_CCU"))
+    BLR_PROCESSED_FOLDER = _resolve_path(P.get("blr_processed_folder", "AUTO"),
+                                         os.path.join(BASE_DATA_DIR, "PROCESSED_BLR"))
+    DAILY_PATH           = _resolve_path(P.get("daily_sheet", "AUTO"),
+                                         os.path.join(BASE_DATA_DIR, "PRADEEP_DAILYSHEET.xlsm"))
+    ARCHIVE_FOLDER       = _resolve_path(CLEANUP_CFG.get("archive_folder", "AUTO"),
+                                         os.path.join(BASE_DATA_DIR, "ARCHIVE"))
+
     EXTRACT_SHEET        = S["extract_sheet"]
     DAILY_SHEET_NAME     = S["daily_sheet_name"]
     MACRO_WAIT           = max(float(S["macro_wait_sec"]), 1.0)
@@ -78,14 +256,68 @@ def _init_globals():
     BLR_EXTRACT_SHEET    = S["blr_extract_sheet"]
     BLR_DAILY_SHEET      = S["blr_sheet_name"]
 
+    # ── Column maps config se load — magic numbers hata diye ──────────────────
+    _load_column_maps()
+
+    # ── Zero-config: saari zaroori directories bana do ────────────────────────
+    ensure_dirs(BASE_DATA_DIR, PROCESSED_FOLDER, BLR_PROCESSED_FOLDER, ARCHIVE_FOLDER)
+
     AGENT_LIST_CCU = load_agents("CCU")
     AGENT_LIST_BLR = load_agents("BLR")
     AGENT_LIST     = AGENT_LIST_CCU
     print(f"[CONFIG] Loaded — CCU agents:{len(AGENT_LIST_CCU)}  BLR agents:{len(AGENT_LIST_BLR)}")
+    print(f"[CONFIG] Watch:{WATCH_FOLDER}")
+    print(f"[CONFIG] Data dir:{BASE_DATA_DIR}")
 
 # ─── AGENTS MASTER ────────────────────────────────────────────────────────────
 
-AGENTS_MASTER_PATH = _resource("AGENTS_MASTER.xlsx")
+# Agents master: EXE/script ke saath wali dir mein (writable) preferred —
+# taaki "Add New Agent" changes persist ho. Warna bundled copy (read-only) fallback.
+_AGENTS_EXE_COPY   = os.path.join(_EXE_DIR, "AGENTS_MASTER.xlsx")
+AGENTS_MASTER_PATH = _AGENTS_EXE_COPY if os.path.isfile(_AGENTS_EXE_COPY) \
+                     else _resource("AGENTS_MASTER.xlsx")
+
+_agents_write_lock = threading.Lock()
+
+def add_agent_to_master(name: str, origin: str = "CCU") -> bool:
+    """
+    Naya agent AGENTS_MASTER.xlsx ke correct sheet (CCU/BLR) mein append karo
+    aur in-memory cache turant refresh karo — agli baar autocomplete karega.
+    Return: True agar add/already-present, False on error.
+    """
+    global AGENT_LIST_CCU, AGENT_LIST_BLR, AGENT_LIST
+    name = (name or "").strip().upper()
+    if not name:
+        return False
+    sheet = "BLR" if origin == "BLR" else "CCU"
+    try:
+        with _agents_write_lock:
+            from openpyxl import load_workbook
+            wb = load_workbook(AGENTS_MASTER_PATH)      # writable (read_only=False)
+            if sheet in wb.sheetnames:
+                ws = wb[sheet]
+            else:
+                ws = wb.create_sheet(sheet)
+                ws.cell(row=1, column=1).value = "AWB OWNED BY"
+            existing = set()
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row and row[0]:
+                    existing.add(str(row[0]).strip().upper())
+            if name not in existing:
+                ws.cell(row=ws.max_row + 1, column=1).value = name
+                wb.save(AGENTS_MASTER_PATH)
+            wb.close()
+        # In-memory cache refresh
+        if sheet == "BLR":
+            AGENT_LIST_BLR = sorted(set(AGENT_LIST_BLR) | {name})
+        else:
+            AGENT_LIST_CCU = sorted(set(AGENT_LIST_CCU) | {name})
+            AGENT_LIST     = AGENT_LIST_CCU
+        print(f"[AGENTS] '{name}' → {sheet} sheet (cache refreshed).")
+        return True
+    except Exception as e:
+        print(f"[AGENTS] Add fail: {e}")
+        return False
 
 # ── PATCH 2: load_agents — sheet_name parameter added ─────────────────────────
 def load_agents(sheet_name: str = "CCU") -> list:
@@ -139,29 +371,51 @@ CARGO_PATTERN = re.compile(
     r"([A-Z][^\n]{1,60}?)(?:\s*DIMS:|\n)"  # group 5 = Material description
 )
 
-# ── CCU Column mappings (1-based) ─────────────────────────────────────────────
-# AWB_EXTRACT → CCU DAILYSHEET
-STEP1       = [(6, 12)]                                          # F→L  (Agent, macro trigger)
-STEP2       = [(7,13),(8,14),(9,15),(10,16),(11,18),(12,19),(13,32)]  # G-L→M-S + M→AF(commodity)
-STEP3       = [(1,2),(2,3),(3,5),(4,6)]                         # A-D → B,C,E,F
-STEP_LAST   = [(5,11)]                                           # E→K  (Consignor, last)
-DAILY_AWB_COL   = 2   # B
-DAILY_AGENT_COL = 12  # L
-RATE_COL_EXT    = 10  # J in extract
-BASIC_COL_DAILY = 17  # Q in daily
-DUE_CARR_COL    = 12  # L in extract
+# ── Column mappings — ab config.json ke "column_maps" se load hote hain ───────
+# Fallback defaults (agar config mein column_maps block missing ho) — original
+# hardcoded values ke barabar, taaki purane config bhi safely chalein.
+_DEFAULT_COLUMN_MAPS = {
+    "CCU": {
+        "daily_awb_col": 2, "daily_agent_col": 12,
+        "rate_dest_col": 16, "basic_col": 17,
+        "int_cols": [19], "date_cols": [3],
+        "steps": {
+            "step1":     [[6, 12]],
+            "step2":     [[7, 13], [8, 14], [9, 15], [10, 16], [11, 18], [12, 19], [13, 32]],
+            "step3":     [[1, 2], [2, 3], [3, 5], [4, 6]],
+            "step_last": [[5, 11]],
+        },
+    },
+    "BLR": {
+        "daily_awb_col": 2, "daily_agent_col": 10,
+        "rate_dest_col": 14, "basic_col": 15,
+        "int_cols": [17], "date_cols": [3],
+        "steps": {
+            "step1":     [[1, 2]],
+            "step2":     [[6, 10], [7, 11], [8, 12], [9, 13], [10, 14], [11, 16], [12, 17], [13, 33]],
+            "step3":     [[2, 3], [3, 5], [4, 6]],
+            "step_last": [[5, 9]],
+        },
+    },
+}
 
-# ── PATCH 3: BLR Column mappings ──────────────────────────────────────────────
-# AWB_EXTRACT → BLR DAILYSHEET
-# Fill order: AWB(B) first → macro → Agent(J)..Rate(N) → Date/Dest/Flight → Consignor(I) last
-BLR_STEP1     = [(1, 2)]                                             # A→B  AWB (macro trigger)
-BLR_STEP2     = [(6,10),(7,11),(8,12),(9,13),(10,14),(11,16),(12,17),(13,33)]  # +commodity→AG(33)
-BLR_STEP3     = [(2,3),(3,5),(4,6)]                                  # Date→C, Dest→E, Flight→F
-BLR_STEP_LAST = [(5,9)]                                              # E→I  Consignor (last)
-BLR_DAILY_AWB_COL   = 2   # B
-BLR_DAILY_AGENT_COL = 10  # J
-BLR_RATE_COL_EXT    = 10  # J in extract
-BLR_BASIC_COL_DAILY = 15  # O in daily (flat rate)
+# Runtime column-map (CCU) — _load_column_maps() se set hota hai
+DAILY_AWB_COL   = 2    # B — daily sheet ka AWB column (CCU/BLR dono mein 2)
+DAILY_AGENT_COL = 12
+BASIC_COL_DAILY = 17
+
+def get_column_map(origin: str) -> dict:
+    """Origin ('CCU'/'BLR') ka column-map — config se ya default se."""
+    src = COLUMN_MAPS if COLUMN_MAPS else _DEFAULT_COLUMN_MAPS
+    return src.get(origin, src.get("CCU", _DEFAULT_COLUMN_MAPS["CCU"]))
+
+def _load_column_maps():
+    """Config ke column_maps se derived globals set karo."""
+    global DAILY_AWB_COL, DAILY_AGENT_COL, BASIC_COL_DAILY
+    ccu = get_column_map("CCU")
+    DAILY_AWB_COL   = int(ccu.get("daily_awb_col", 2))
+    DAILY_AGENT_COL = int(ccu.get("daily_agent_col", 12))
+    BASIC_COL_DAILY = int(ccu.get("basic_col", 17))
 
 # Queue: watcher → filler thread
 _fill_queue  = queue.Queue()
@@ -272,6 +526,118 @@ def memory_clear_processed():
         _popup("info", "Reset ✔",
                f"{count} AWB(s) memory se clear ho gaye.\n"
                "Ab same AWBs dobara process ho sakte hain.")
+
+# ─── WEEKLY AUTO-CLEANUP ──────────────────────────────────────────────────────
+# Har `interval_days` (default 7) baad: processed folders ko dated ZIP mein
+# archive karke original delete, aur extract sheets ki purani rows trim (backup
+# ke saath). Destructive kaam se pehle hamesha archive/backup — safe cleanup.
+
+def _cleanup_due() -> bool:
+    """Interval beet gaya? (pehli baar = due). Disabled ho to hamesha False."""
+    if not CLEANUP_CFG.get("enabled", False):
+        return False
+    interval = int(CLEANUP_CFG.get("interval_days", 7))
+    last = memory_load().get("last_cleanup", "")
+    if not last:
+        return True
+    try:
+        last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return True
+    return (datetime.now() - last_dt) >= timedelta(days=interval)
+
+def _archive_and_clear_folder(folder: str, archive_dir: str) -> int:
+    """Folder ki files → dated ZIP, phir original delete. Count return."""
+    if not folder or not os.path.isdir(folder):
+        return 0
+    files = [f for f in glob.glob(os.path.join(folder, "*")) if os.path.isfile(f)]
+    if not files:
+        return 0
+    os.makedirs(archive_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zpath = os.path.join(archive_dir, f"{os.path.basename(folder)}_{stamp}.zip")
+    n = 0
+    try:
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            for fp in files:
+                z.write(fp, os.path.basename(fp)); n += 1
+        for fp in files:                       # ZIP safe → ab delete
+            try: os.remove(fp)
+            except OSError: pass
+    except Exception as e:
+        print(f"[CLEANUP] Archive fail {folder}: {e}")
+        return 0
+    print(f"[CLEANUP] {n} files → {os.path.basename(zpath)}")
+    return n
+
+def _trim_extract_rows() -> int:
+    """
+    Extract sheets (CCU+BLR) ki purani rows hatao — sirf latest keep_recent_rows
+    rakho. Delete se pehle poori file ka timestamped backup ARCHIVE mein.
+    """
+    if not CLEANUP_CFG.get("trim_extract_rows", False):
+        return 0
+    if not os.path.isfile(EXTRACT_PATH):
+        return 0
+    keep = int(CLEANUP_CFG.get("keep_recent_rows", 500))
+    removed_total = 0
+    try:
+        from openpyxl import load_workbook
+        os.makedirs(ARCHIVE_FOLDER, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bkp = os.path.join(ARCHIVE_FOLDER, f"AWB_EXTRACT_backup_{stamp}.xlsx")
+        shutil.copy2(EXTRACT_PATH, bkp)
+        print(f"[CLEANUP] Extract backup → {os.path.basename(bkp)}")
+
+        wb = load_workbook(EXTRACT_PATH)
+        for sn in (EXTRACT_SHEET, BLR_EXTRACT_SHEET):
+            if sn not in wb.sheetnames:
+                continue
+            ws = wb[sn]
+            data_rows = [r for r in range(2, ws.max_row + 1)
+                         if ws.cell(row=r, column=1).value not in (None, "")]
+            excess = len(data_rows) - keep
+            if excess > 0:
+                ws.delete_rows(2, excess)   # top (purani) rows delete
+                removed_total += excess
+                print(f"[CLEANUP] {sn}: {excess} purani rows removed (kept {keep})")
+        wb.save(EXTRACT_PATH)
+        wb.close()
+    except Exception as e:
+        print(f"[CLEANUP] Extract trim fail: {e}")
+    return removed_total
+
+def run_cleanup(force: bool = False):
+    """Full cleanup cycle. force=True → interval ignore karke abhi chalao."""
+    if not force and not _cleanup_due():
+        return
+    print("\n[CLEANUP] Cleanup shuru...")
+    c1   = _archive_and_clear_folder(PROCESSED_FOLDER, ARCHIVE_FOLDER)
+    c2   = _archive_and_clear_folder(BLR_PROCESSED_FOLDER, ARCHIVE_FOLDER)
+    rows = _trim_extract_rows()
+    with _memory_lock:
+        mem = memory_load()
+        mem["last_cleanup"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        memory_save(mem)
+    print(f"[CLEANUP] Done — CCU:{c1} BLR:{c2} files archived, {rows} extract rows trimmed.")
+    _notify("🧹 Cleanup Complete",
+            f"{c1 + c2} files archived • {rows} old rows trimmed")
+
+def _cleanup_scheduler():
+    """Background thread — boot ke baad check, phir har 12 ghante recheck."""
+    time.sleep(30)   # init settle hone do
+    while True:
+        try:
+            run_cleanup(force=False)
+        except Exception as e:
+            print(f"[CLEANUP] Scheduler error: {e}")
+        time.sleep(12 * 3600)
+
+def start_cleanup_scheduler():
+    if CLEANUP_CFG.get("enabled", False):
+        threading.Thread(target=_cleanup_scheduler, daemon=True,
+                         name="CleanupScheduler").start()
+        print(f"[CLEANUP] Scheduler active — interval {CLEANUP_CFG.get('interval_days', 7)} days")
 
 # ─── PDF DETECTION ────────────────────────────────────────────────────────────
 
@@ -396,6 +762,8 @@ class RenameDialog:
         self._err_job   = None
         self._ac_win    = None
         self._ac_list   = None
+        self._add_btn   = None      # "Add new agent" button (dynamic)
+        self._add_name  = ""        # naam jo add hoga
 
     def show(self):
         self._build()
@@ -408,7 +776,7 @@ class RenameDialog:
         self.root.configure(bg=f"#{self.BG}")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
-        W,H=430,310
+        W,H=430,360   # +50px — dynamic "Add New Agent" button ke liye jagah
         sw=self.root.winfo_screenwidth(); sh=self.root.winfo_screenheight()
         self.root.geometry(f"{W}x{H}+{(sw-W)//2}+{(sh-H)//2-40}")
 
@@ -470,6 +838,16 @@ class RenameDialog:
         tk.Label(card, textvariable=self._hint_var,
                  bg=f"#{self.CARD}", fg="#FF7070",
                  font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
+
+        # ── Dynamic "Add New Agent" button — naya naam type karne par dikhta hai ──
+        self._add_frame = tk.Frame(card, bg=f"#{self.CARD}")
+        self._add_frame.pack(fill="x", pady=(4, 0))   # frame reserve; button toggle
+        self._add_btn = tk.Button(
+            self._add_frame, text="", font=("Segoe UI", 9, "bold"),
+            bg=f"#{self.GREEN}", fg="white",
+            activebackground="#27AE73", activeforeground="white",
+            bd=0, padx=12, pady=6, cursor="hand2", command=self._add_new_agent)
+        # by default hidden — _show_add_button() pack karega
 
         self._ac_win  = None
         self._ac_list = None
@@ -548,10 +926,12 @@ class RenameDialog:
         if not typed:
             self._ac_hide()
             self._hint_var.set("")
+            self._hide_add_button()
             return
 
         # self.agent_list use karo (CCU ya BLR ke hisaab se)
         filtered = [a for a in self.agent_list if typed in a]
+        exact    = typed in self.agent_list
         if filtered:
             self._hint_var.set(f"↓ {len(filtered)} match — Down arrow ya click")
             self._ac_show(filtered)
@@ -562,7 +942,49 @@ class RenameDialog:
                 self._hint_var.set(f"Did you mean: {close[0]}?")
                 self._ac_show(close)
             else:
-                self._hint_var.set("No match found")
+                self._hint_var.set("Naya naam — neeche button se master mein add karo")
+
+        # ── Dynamic add button: exact match nahi hai to "Add as New Agent" ──────
+        if not exact and len(typed) >= 2:
+            self._show_add_button(typed)
+        else:
+            self._hide_add_button()
+
+    # ── Add-new-agent GUI helpers (Step 4) ────────────────────────────────────
+    def _show_add_button(self, name: str):
+        self._add_name = name
+        try:
+            self._add_btn.config(text=f"➕  Add  “{name}”  as New Agent  ({self.origin})")
+            if not self._add_btn.winfo_ismapped():
+                self._add_btn.pack(anchor="w")
+        except Exception:
+            pass
+
+    def _hide_add_button(self):
+        self._add_name = ""
+        try:
+            if self._add_btn and self._add_btn.winfo_ismapped():
+                self._add_btn.pack_forget()
+        except Exception:
+            pass
+
+    def _add_new_agent(self):
+        """Button click → master xlsx mein add + cache refresh, phir submit."""
+        name = (self._add_name or self._var.get()).strip().upper()
+        if not name:
+            return
+        ok = add_agent_to_master(name, self.origin)
+        if ok:
+            # Local dialog cache bhi refresh (turant autocomplete ke liye)
+            self.agent_list = AGENT_LIST_BLR if self.origin == "BLR" else AGENT_LIST_CCU
+            self._hint_var.set(f"✔ '{name}' {self.origin} master mein add ho gaya")
+            self._hide_add_button()
+            self._ac_hide()
+            self._var.set(name)
+            self.agent_name = name
+            self.root.after(120, self.root.destroy)
+        else:
+            self._hint_var.set("⚠ Add fail — master file locked/read-only?")
 
     # ── PATCH 9: _ac_show — self.agent_list use karo ──────────────────────────
     def _ac_show(self, matches):
@@ -902,34 +1324,57 @@ class PDFHandler(FileSystemEventHandler):
 
 _auto_fill_queue  = queue.Queue()   # sequential fill queue
 _auto_fill_worker_started = False
+_worker_start_lock = threading.Lock()   # idempotent start guard
 
 def _start_auto_fill_worker():
-    """Ek worker thread — queue se ek-ek fill karo."""
+    """
+    Background fill worker start karo — idempotent (ek hi thread guarantee).
+    Boot pe bhi call hota hai taaki pehli PDF pe delay na ho.
+    """
     global _auto_fill_worker_started
-    if _auto_fill_worker_started:
-        return
-    _auto_fill_worker_started = True
-    def _worker():
+    with _worker_start_lock:
+        if _auto_fill_worker_started:
+            return
+        _auto_fill_worker_started = True
+    threading.Thread(target=_auto_fill_worker_loop, daemon=True,
+                     name="AutoFillWorker").start()
+    print("[AUTO-FILL] Worker thread started")
+
+def _auto_fill_worker_loop():
+    """
+    Async pipeline ka dil:
+      • COM sirf EK baar initialize (per-item nahi — fast)
+      • Queue se items back-to-back — watcher/UI kabhi block nahi hota
+      • User lagataar PDFs download kar sakta hai bina file-lock/freeze ke
+    """
+    import pythoncom
+    pythoncom.CoInitialize()
+    try:
         while True:
             try:
                 task = _auto_fill_queue.get(timeout=2)
-                if task is None:
-                    break
-                pdf_path, origin, agent = task
-                try:
-                    auto_fill_single(pdf_path, origin, agent)
-                except Exception as e:
-                    print(f"[AUTO-FILL WORKER] {e}")
-                    _notify("❌ Auto Fill Error", str(e)[:80])
             except queue.Empty:
-                pass
-    threading.Thread(target=_worker, daemon=True, name="AutoFillWorker").start()
-    print("[AUTO-FILL] Worker thread started")
+                continue
+            if task is None:
+                break
+            pdf_path, origin, agent = task
+            try:
+                auto_fill_single(pdf_path, origin, agent)
+            except Exception as e:
+                print(f"[AUTO-FILL WORKER] {e}")
+                _notify("❌ Auto Fill Error", str(e)[:80])
+            finally:
+                try: _auto_fill_queue.task_done()
+                except Exception: pass
+    finally:
+        try: pythoncom.CoUninitialize()
+        except Exception: pass
 
 def auto_fill_single(pdf_path: str, origin: str, agent: str):
-    """Queue worker mein chalta hai — sequential, thread-safe."""
-    import pythoncom
-    pythoncom.CoInitialize()
+    """
+    Queue worker (AutoFillWorker thread) mein chalta hai — sequential, thread-safe.
+    NOTE: COM init worker loop mein hota hai, yahan nahi (per-item overhead hata).
+    """
     awb_display = ""
     excel       = None
     opened_new  = False
@@ -968,7 +1413,7 @@ def auto_fill_single(pdf_path: str, origin: str, agent: str):
         if wb_daily is None:
             wb_daily = excel.Workbooks.Open(DAILY_PATH)
 
-        sheet_name = cfg["daily_sheet_name"]
+        sheet_name = resolve_fy_sheet(origin, wb_daily)   # dynamic FY + fallback
         ws_daily   = None
         for sh in wb_daily.Sheets:
             if sh.Name.strip().lower() == sheet_name.strip().lower():
@@ -1012,14 +1457,13 @@ def auto_fill_single(pdf_path: str, origin: str, agent: str):
         _notify("❌ Auto Fill Error",
                 f"AWB {awb_display or '?'} — {str(e)[:60]}")
     finally:
+        # COM init/uninit worker loop ke zimme hai — yahan sirf Excel state restore
         try:
             if excel: excel.DisplayAlerts = True
             if opened_new and excel:
                 try:
                     if excel.Workbooks.Count == 0: excel.Quit()
                 except Exception: pass
-        except Exception: pass
-        try: pythoncom.CoUninitialize()
         except Exception: pass
 
 # ─── PHASE 2: EXTRACT ─────────────────────────────────────────────────────────
@@ -1104,6 +1548,32 @@ def _copy_row_style(ws, from_row, to_row):
             dest.alignment     = copy(src.alignment)
             dest.number_format = src.number_format
     ws.row_dimensions[to_row].height = ws.row_dimensions[from_row].height or 18.75
+
+_EXTRACT_HEADERS = ["AWB NO.", "DATE", "DEST", "FLIGHT", "CONSIGNOR (shipper`s)",
+                    "AWB OWNED BY", "MATERIALS DESCRIPTION", "PCS", "CH. WT",
+                    "RATE", "DUE AGENT", "DUE CARRIER", "COMODITY ITEM"]
+
+def _scaffold_extract_excel(path: str) -> bool:
+    """
+    Zero-config: agar extract Excel missing hai to CCU+BLR sheets + headers ke
+    saath blank file bana do. Return True on success.
+    """
+    try:
+        from openpyxl import Workbook
+        ensure_dirs(os.path.dirname(path))
+        wb = Workbook()
+        first = wb.active
+        first.title = "CCU"
+        blr = wb.create_sheet("BLR")
+        for ws in (first, blr):
+            for col, hdr in enumerate(_EXTRACT_HEADERS, 1):
+                ws.cell(row=1, column=col).value = hdr
+        wb.save(path)
+        wb.close()
+        return True
+    except Exception as e:
+        print(f"[SETUP] Extract scaffold fail: {e}")
+        return False
 
 # ── PATCH 14: save_to_extract — sheet_name param added ────────────────────────
 def save_to_extract(data: dict, sheet_name: str = None) -> str:
@@ -1216,79 +1686,51 @@ def _daily_existing_awbs(ws_daily) -> set:
         return {str(row[0]).strip() for row in rng if row[0]}
     return {str(rng).strip()} if rng else set()
 
-# CCU fill — unchanged
-def fill_daily_row(ws_daily, target_row: int, data: dict):
-    for sc,dc in STEP1:
-        ws_daily.Cells(target_row, dc).Value = data.get(sc,"")
+# ── Generic config-driven fill — CCU/BLR dono ke liye ek hi engine ────────────
+def _fill_daily_row_generic(ws_daily, target_row: int, data: dict, origin: str):
+    """
+    Origin ka column-map (config.json → column_maps) use karke daily sheet
+    fill karta hai. Magic numbers ab config mein hain:
+      • rate_dest_col → flat-rate logic (>= FLAT_RATE_LIMIT → basic_col)
+      • int_cols      → integer conversion (Due Carrier)
+      • date_cols     → Excel serial date + DD-MM-YYYY format
+    Fill order preserve: step1 (macro trigger) → wait → step2 → step3 → step_last
+    """
+    cmap      = get_column_map(origin)
+    steps     = cmap.get("steps", {})
+    rate_col  = int(cmap.get("rate_dest_col", -1))
+    basic_col = int(cmap.get("basic_col", BASIC_COL_DAILY))
+    int_cols  = set(cmap.get("int_cols", []))
+    date_cols = set(cmap.get("date_cols", []))
+
+    def _set(dc, value):
+        ws_daily.Cells(target_row, dc).Value = value
+
+    # Step 1 — macro trigger (CCU: Agent→L | BLR: AWB→B)
+    for sc, dc in steps.get("step1", []):
+        _set(dc, data.get(sc, ""))
     time.sleep(MACRO_WAIT)
 
-    for sc,dc in STEP2:
-        val = data.get(sc,"")
-        if dc == 16:
-            try: rate_val = float(str(val).replace(",","") or 0)
-            except (ValueError,TypeError): rate_val = 0
-            ws_daily.Cells(target_row,dc).Value = rate_val
-            if rate_val >= FLAT_RATE_LIMIT:
-                ws_daily.Cells(target_row, BASIC_COL_DAILY).Value = rate_val
-                print(f"      Flat rate {rate_val:.0f} → Q = {rate_val:.0f}")
-        elif dc == 19:
-            try: ws_daily.Cells(target_row,dc).Value = int(float(str(val) or 0))
-            except (ValueError,TypeError): ws_daily.Cells(target_row,dc).Value = val
-        else:
-            ws_daily.Cells(target_row,dc).Value = val
-
-    for sc,dc in STEP3:
-        val = data.get(sc,"")
-        if dc == 3:
-            try:
-                from datetime import datetime as _dt
-                d = _dt.strptime(str(val), "%d-%m-%Y")
-                excel_serial = (d - _dt(1899, 12, 30)).days
-                cell = ws_daily.Cells(target_row, dc)
-                cell.Value        = excel_serial
-                cell.NumberFormat = "DD-MM-YYYY"
-                continue
-            except (ValueError, TypeError):
-                pass
-        ws_daily.Cells(target_row,dc).Value = val
-
-    for sc,dc in STEP_LAST:
-        ws_daily.Cells(target_row,dc).Value = data.get(sc,"")
-
-# ── PATCH 17: fill_daily_row_blr — nayi BLR fill function ─────────────────────
-def fill_daily_row_blr(ws_daily, target_row: int, data: dict):
-    """
-    BLR Daily Sheet fill:
-    Step 1 — AWB → B(2)   [macro trigger — AWB first]
-    Step 2 — Agent→J, Material→K, PCS→L, CHW→M, Rate→N, DueAgent→P, DueCarrier→Q
-    Step 3 — Date→C, Dest→E, Flight→F
-    Last   — Consignor → I(9)
-    """
-    # Step 1 — AWB → B (macro trigger)
-    for sc, dc in BLR_STEP1:
-        ws_daily.Cells(target_row, dc).Value = data.get(sc, "")
-    time.sleep(MACRO_WAIT)
-
-    # Step 2 — Agent, Material, PCS, CHW, Rate, DueAgent, DueCarrier
-    for sc, dc in BLR_STEP2:
+    # Step 2 — bulk fields (rate + int special-cased)
+    for sc, dc in steps.get("step2", []):
         val = data.get(sc, "")
-        if dc == 14:   # N = Rate
+        if dc == rate_col:
             try: rate_val = float(str(val).replace(",", "") or 0)
             except (ValueError, TypeError): rate_val = 0
-            ws_daily.Cells(target_row, dc).Value = rate_val
+            _set(dc, rate_val)
             if rate_val >= FLAT_RATE_LIMIT:
-                ws_daily.Cells(target_row, BLR_BASIC_COL_DAILY).Value = rate_val
-                print(f"      BLR Flat rate {rate_val:.0f} → O = {rate_val:.0f}")
-        elif dc == 17:  # Q = Due Carrier (int)
-            try: ws_daily.Cells(target_row, dc).Value = int(float(str(val) or 0))
-            except (ValueError, TypeError): ws_daily.Cells(target_row, dc).Value = val
+                _set(basic_col, rate_val)
+                print(f"      [{origin}] Flat rate {rate_val:.0f} → col {basic_col}")
+        elif dc in int_cols:
+            try: _set(dc, int(float(str(val) or 0)))
+            except (ValueError, TypeError): _set(dc, val)
         else:
-            ws_daily.Cells(target_row, dc).Value = val
+            _set(dc, val)
 
-    # Step 3 — Date→C, Dest→E, Flight→F
-    for sc, dc in BLR_STEP3:
+    # Step 3 — date + rest
+    for sc, dc in steps.get("step3", []):
         val = data.get(sc, "")
-        if dc == 3:   # C = Date — Excel serial
+        if dc in date_cols:
             try:
                 from datetime import datetime as _dt
                 d = _dt.strptime(str(val), "%d-%m-%Y")
@@ -1299,11 +1741,18 @@ def fill_daily_row_blr(ws_daily, target_row: int, data: dict):
                 continue
             except (ValueError, TypeError):
                 pass
-        ws_daily.Cells(target_row, dc).Value = val
+        _set(dc, val)
 
-    # Last — Consignor → I(9)
-    for sc, dc in BLR_STEP_LAST:
-        ws_daily.Cells(target_row, dc).Value = data.get(sc, "")
+    # Step last — Consignor (formula/dependency ke liye sabse aakhir mein)
+    for sc, dc in steps.get("step_last", []):
+        _set(dc, data.get(sc, ""))
+
+# ── Thin wrappers — purane call sites (fill_fn) bina change chalte rahein ─────
+def fill_daily_row(ws_daily, target_row: int, data: dict):
+    _fill_daily_row_generic(ws_daily, target_row, data, "CCU")
+
+def fill_daily_row_blr(ws_daily, target_row: int, data: dict):
+    _fill_daily_row_generic(ws_daily, target_row, data, "BLR")
 
 # ── PATCH 18: _do_extract_phase — sab PDFs ek saath, origin-wise route ────────
 def _do_extract_phase() -> tuple:
@@ -1361,7 +1810,7 @@ def _do_fill_phase(origin: str, excel, wb_daily) -> tuple:
     Returns: (added_list, failed_list)
     """
     cfg        = get_origin_cfg(origin)
-    sheet_name = cfg["daily_sheet_name"]
+    sheet_name = resolve_fy_sheet(origin, wb_daily)   # dynamic FY + fallback
     fill_fn    = fill_daily_row_blr if origin == "BLR" else fill_daily_row
 
     extract_rows = read_extract_rows(cfg["extract_sheet"])
@@ -1616,6 +2065,11 @@ def build_tray():
     def on_reset(icon, item):
         threading.Thread(target=memory_clear_processed, daemon=True).start()
 
+    def on_cleanup(icon, item):
+        print("\n[TRAY] Run Cleanup Now clicked")
+        threading.Thread(target=run_cleanup, kwargs={"force": True},
+                         daemon=True).start()
+
     def on_exit(icon, item):
         print("\n[TRAY] Exit clicked — saving memory...")
         icon.stop()
@@ -1631,6 +2085,7 @@ def build_tray():
         pystray.MenuItem("📂 Extract PDFs Only",    on_process),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("🕐 Last Session Info",    on_last),
+        pystray.MenuItem("🧹 Run Cleanup Now",      on_cleanup),
         pystray.MenuItem("🗑 Reset Memory",         on_reset),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("❌ Exit",                 on_exit),
@@ -1776,21 +2231,12 @@ def run_setup_wizard() -> bool:
                     parent=root)
                 return
 
-        # Config dict banao
-        cfg_new = {
-            "paths": {
-                k: v.get().strip()
-                for k, v in zip(cfg_keys, vars_)
-            },
-            "settings": {
-                "extract_sheet"       : "CCU",
-                "blr_extract_sheet"   : "BLR",
-                "daily_sheet_name"    : "ccu_2025-26",
-                "blr_sheet_name"      : "BLR-2025-26",
-                "macro_wait_sec"      : 0.6,
-                "flat_rate_threshold" : 1000
-            }
-        }
+        # Config dict banao — paths user se, baaki (FY/cleanup/column_maps)
+        # default template se preserve. base_data_dir AUTO rakho (project-relative).
+        cfg_new = _default_config_template()
+        cfg_new["paths"]["base_data_dir"] = "AUTO"
+        for k, v in zip(cfg_keys, vars_):
+            cfg_new["paths"][k] = v.get().strip()
 
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -1869,14 +2315,23 @@ def main():
     except Exception as e:
         _fatal(f"Config load error:\n{e}\n\nconfig.json check karo ya delete\nkaro taaki Setup Wizard dobara chale.")
 
-    # ── STEP 3: Path validation ────────────────────────────────────────────────
+    # ── STEP 3: Path validation (zero-config friendly) ────────────────────────
+    # Watch folder — missing ho to bana do (downloads to hamesha hota hai, lekin
+    # custom relative path ke liye safe).
+    if not os.path.isdir(WATCH_FOLDER):
+        ensure_dirs(WATCH_FOLDER)
+    # Extract Excel — missing ho to blank scaffold bana do (headers ke saath).
+    if not os.path.isfile(EXTRACT_PATH):
+        if _scaffold_extract_excel(EXTRACT_PATH):
+            print(f"[SETUP] Extract Excel scaffold banaya: {EXTRACT_PATH}")
+
+    # Daily sheet (.xlsm) — yeh user ki asli macro file hai, auto-create nahi
+    # ho sakti. Sirf yahi hard requirement hai.
     errors = []
     if not os.path.isdir(WATCH_FOLDER):
-        errors.append(f"Watch folder nahi mila:\n  {WATCH_FOLDER}")
-    if not os.path.isfile(EXTRACT_PATH):
-        errors.append(f"Extract Excel nahi mila:\n  {EXTRACT_PATH}")
+        errors.append(f"Watch folder nahi mila/ban nahi paya:\n  {WATCH_FOLDER}")
     if not os.path.isfile(DAILY_PATH):
-        errors.append(f"DAILYSHEET nahi mila:\n  {DAILY_PATH}")
+        errors.append(f"DAILYSHEET (.xlsm) nahi mila:\n  {DAILY_PATH}")
     if errors:
         # Config delete karo taaki wizard dobara chale
         try: os.remove(CONFIG_FILE)
@@ -1895,6 +2350,12 @@ def main():
     print("╚══════════════════════════════════════════╝\n")
 
     threading.Thread(target=show_startup_info, daemon=True).start()
+
+    # ── Async fill worker boot pe start — pehli PDF pe delay na ho ────────────
+    _start_auto_fill_worker()
+
+    # ── Weekly auto-cleanup scheduler ─────────────────────────────────────────
+    start_cleanup_scheduler()
 
     observer = Observer()
     observer.schedule(PDFHandler(), WATCH_FOLDER, recursive=False)
