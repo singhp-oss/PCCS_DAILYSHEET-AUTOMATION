@@ -14,7 +14,7 @@ Install: pip install watchdog pypdf openpyxl pywin32 pystray Pillow
 Run    : python PCCS_MASTER.py  (ya START.bat)
 """
 
-import os, re, sys, json, time, shutil, glob, threading, queue, zipfile, gc
+import os, re, sys, json, time, shutil, glob, threading, queue, zipfile, gc, subprocess
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 import difflib
@@ -1873,6 +1873,62 @@ def _do_fill_phase(origin: str, excel, wb_daily) -> tuple:
 
     return added, failed
 
+# ── Ghost-process (excel.exe) PID tracking + targeted kill ────────────────────
+# win32com ka known reference-counting bug: Quit() ke baad bhi excel.exe kabhi
+# kabhi zinda reh jata hai (COM interface release nahi hoti). Fix: HUMARE banaye
+# instance ka EXACT PID capture karo, aur teardown pe sirf WAHI PID kill karo.
+# NOTE: '/im excel.exe' kabhi use nahi — woh user ki khuli Excel bhi maar deta.
+
+def _excel_pids() -> set:
+    """Abhi chal rahe saare excel.exe ke PIDs (set)."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/fi", "IMAGENAME eq excel.exe", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+        pids = set()
+        for line in out.splitlines():
+            cells = [c.strip().strip('"') for c in line.split('","')]
+            if len(cells) >= 2 and cells[0].lower() == "excel.exe":
+                try: pids.add(int(cells[1]))
+                except (ValueError, TypeError): pass
+        return pids
+    except Exception:
+        return set()
+
+def _excel_hwnd_pid(excel):
+    """COM Application object se uska process PID (Hwnd ke through)."""
+    try:
+        import win32process
+        _tid, pid = win32process.GetWindowThreadProcessId(excel.Hwnd)
+        return pid or None
+    except Exception:
+        return None
+
+def _force_kill_excel_pid(pid):
+    """
+    Sirf diye gaye PID ka excel.exe force-kill — PID-reuse guard ke saath.
+    User ki koi bhi Excel touch nahi hoti (image-name kill nahi hai).
+    """
+    if not pid:
+        return False
+    try:
+        # PID abhi bhi excel.exe hai? (reuse guard)
+        chk = subprocess.run(
+            ["tasklist", "/fi", f"PID eq {pid}", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout.lower()
+        if "excel.exe" not in chk:
+            return False   # already gaya ya reuse ho gaya — kuch mat karo
+        os.system(f'taskkill /f /pid {pid} >nul 2>&1')
+        print(f"  [EXCEL] Ghost PID {pid} force-killed (targeted, user-safe).")
+        return True
+    except Exception as e:
+        print(f"[EXCEL] pid kill error: {e}")
+        return False
+
 # ── Ownership-aware, non-locking Excel helpers ────────────────────────────────
 def _find_open_daily(excel):
     """Diye Excel app mein already-open daily workbook return karo, warna None."""
@@ -1902,6 +1958,7 @@ def _open_daily_workbook(visible_if_new: bool = False):
     import win32com.client
     excel      = None
     opened_app = False
+    own_pid    = None
 
     # 1) Running Excel se attach try karo (user ki instance)
     try:
@@ -1912,10 +1969,18 @@ def _open_daily_workbook(visible_if_new: bool = False):
 
     # 2) Koi running instance nahi → naya banao (default hidden — no flashing)
     if excel is None:
+        pids_before = _excel_pids()                     # ghost-tracking baseline
         excel = win32com.client.Dispatch("Excel.Application")
         excel.Visible = bool(visible_if_new)
         opened_app    = True
-        print(f"  [EXCEL] Naya instance khola (visible={bool(visible_if_new)}).")
+        # HUMARE instance ka exact PID capture — teardown pe targeted kill ke liye
+        own_pid = _excel_hwnd_pid(excel)
+        if own_pid is None:
+            new_pids = _excel_pids() - pids_before
+            if len(new_pids) == 1:
+                own_pid = next(iter(new_pids))
+        print(f"  [EXCEL] Naya instance khola (visible={bool(visible_if_new)}, "
+              f"pid={own_pid}).")
 
     excel.DisplayAlerts = False
     excel.EnableEvents  = True
@@ -1925,13 +1990,13 @@ def _open_daily_workbook(visible_if_new: bool = False):
     if wb_daily is not None:
         print("  [EXCEL] Daily sheet ALREADY OPEN — attach mode (no lock).")
         return excel, wb_daily, {"attached": True, "opened_wb": False,
-                                 "opened_app": opened_app}
+                                 "opened_app": opened_app, "pid": own_pid}
 
     # 4) Nahi khuli → hum kholte hain (write ke baad band hogi)
     wb_daily = excel.Workbooks.Open(DAILY_PATH)
     print("  [EXCEL] Daily sheet background open kiya.")
     return excel, wb_daily, {"attached": False, "opened_wb": True,
-                             "opened_app": opened_app}
+                             "opened_app": opened_app, "pid": own_pid}
 
 def _finish_daily_workbook(excel, wb_daily, ctx, keep_open: bool = False,
                            save: bool = True):
@@ -1973,35 +2038,53 @@ def _finish_daily_workbook(excel, wb_daily, ctx, keep_open: bool = False,
         except Exception: pass
         return
 
-    # ── Case C: HUMNE background mein kholi → STRICT teardown ─────────────────
-    # Yahi woh path hai jahan pehle orphan excel.exe bacha rehta tha.
-    # Fix: Close + Quit UNCONDITIONAL (Workbooks.Count guard hata diya — kyunki
-    # PERSONAL.XLSB / add-ins Count ko kabhi 0 nahi hone dete the), phir del + gc.
+    # ── Case C: HUMNE background mein kholi → STRICT + GHOST-PROOF teardown ────
+    # Do-step approach:
+    #   1) GRACEFUL   : Close(SaveChanges) → Quit() → del refs → gc.collect()
+    #                   (Workbooks.Count guard hata diya — PERSONAL.XLSB/add-ins
+    #                    Count ko kabhi 0 nahi hone dete the → Quit skip → ghost)
+    #   2) LAST-RESORT: agar win32com ref-count bug se PID phir bhi zinda hai to
+    #                   taskkill /f /pid <HAMARA_pid> — SIRF hamara process, kabhi
+    #                   '/im excel.exe' nahi (user ki Excel 100% safe).
+    own_pid = ctx.get("pid")
     try:
+        # 1a) Workbook close → file lock release
         if wb_daily is not None:
             try:
                 wb_daily.Close(SaveChanges=bool(save))
             except Exception as e:
                 print(f"[EXCEL] close error: {e}")
-
+        # 1b) App quit (unconditional)
         if excel is not None:
-            try:
-                excel.DisplayAlerts = True
+            try: excel.DisplayAlerts = True
             except Exception: pass
             try:
-                excel.Quit()          # ← ALWAYS quit (no Count guard)
+                excel.Quit()
             except Exception as e:
                 print(f"[EXCEL] quit error: {e}")
     finally:
-        # COM references explicitly drop karo — Windows file lock isi par release
-        # hota hai. Local names delete + gc taaki pywin32 ka wrapper turant free ho.
+        # 1c) COM references explicitly release + GC — normal case yahin process
+        #     mar jata hai aur lock free ho jata hai.
         try: del wb_daily
         except Exception: pass
         try: del excel
         except Exception: pass
-        try:
-            gc.collect()
+        try: gc.collect()
         except Exception: pass
+
+    # 2) GHOST FALLBACK — sirf tab jab HUMNE app banaya (opened_app) aur PID pata ho.
+    #    Quit ko settle hone ka thoda time do, phir zinda ho to targeted kill.
+    if ctx.get("opened_app") and own_pid:
+        try:
+            time.sleep(0.6)                       # graceful exit ka mauka
+            if own_pid in _excel_pids():          # abhi bhi zinda = ghost
+                print(f"  [EXCEL] PID {own_pid} Quit ke baad bhi zinda — "
+                      f"targeted force-kill.")
+                _force_kill_excel_pid(own_pid)
+            else:
+                print(f"  [EXCEL] PID {own_pid} clean exit — koi ghost nahi.")
+        except Exception as e:
+            print(f"[EXCEL] ghost check error: {e}")
 
 # Backward-compat shim — purane callers ke liye (attach/open, keep open)
 def _get_or_open_excel():
