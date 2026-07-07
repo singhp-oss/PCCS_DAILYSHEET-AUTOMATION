@@ -14,7 +14,7 @@ Install: pip install watchdog pypdf openpyxl pywin32 pystray Pillow
 Run    : python PCCS_MASTER.py  (ya START.bat)
 """
 
-import os, re, sys, json, time, shutil, glob, threading, queue, zipfile
+import os, re, sys, json, time, shutil, glob, threading, queue, zipfile, gc
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 import difflib
@@ -1344,8 +1344,9 @@ def _auto_fill_worker_loop():
     """
     Async pipeline ka dil:
       • COM sirf EK baar initialize (per-item nahi — fast)
-      • Queue se items back-to-back — watcher/UI kabhi block nahi hota
-      • User lagataar PDFs download kar sakta hai bina file-lock/freeze ke
+      • Ek burst (jitne PDFs ek saath queued) ko EK hi workbook open/close cycle
+        mein process — fast + non-locking
+      • Watcher/UI kabhi block nahi hota; user lagataar download kar sakta hai
     """
     import pythoncom
     pythoncom.CoInitialize()
@@ -1357,113 +1358,127 @@ def _auto_fill_worker_loop():
                 continue
             if task is None:
                 break
-            pdf_path, origin, agent = task
+            # Is task + jo abhi queued hai sab ek batch — burst ko ek cycle mein
+            batch = [task]
+            while True:
+                try:
+                    batch.append(_auto_fill_queue.get_nowait())
+                except queue.Empty:
+                    break
+            batch = [t for t in batch if t is not None]
             try:
-                auto_fill_single(pdf_path, origin, agent)
+                _process_fill_batch(batch)
             except Exception as e:
                 print(f"[AUTO-FILL WORKER] {e}")
                 _notify("❌ Auto Fill Error", str(e)[:80])
             finally:
-                try: _auto_fill_queue.task_done()
-                except Exception: pass
+                for _ in batch:
+                    try: _auto_fill_queue.task_done()
+                    except Exception: pass
     finally:
         try: pythoncom.CoUninitialize()
         except Exception: pass
 
-def auto_fill_single(pdf_path: str, origin: str, agent: str):
+def _fill_one_awb(excel, wb_daily, pdf_path: str, origin: str, agent: str) -> bool:
     """
-    Queue worker (AutoFillWorker thread) mein chalta hai — sequential, thread-safe.
-    NOTE: COM init worker loop mein hota hai, yahan nahi (per-item overhead hata).
+    Ek AWB PDF → extract → staging → daily sheet row fill.
+    Workbook pehle se OPEN pass hoti hai (batch cycle) — yahan open/close nahi.
+    Return: True agar row likhi gayi (Save chahiye), False agar skip/dup/fail.
     """
-    awb_display = ""
-    excel       = None
-    opened_new  = False
-    try:
-        print(f"[AUTO-FILL] Extracting: {os.path.basename(pdf_path)}")
-        data = extract_from_pdf(pdf_path)
-        if not data or not data.get("awb_no"):
-            _notify("❌ Extract Fail",
-                    f"{os.path.basename(pdf_path)} — manual fill karo")
-            return
+    print(f"[AUTO-FILL] Extracting: {os.path.basename(pdf_path)}")
+    data = extract_from_pdf(pdf_path)
+    if not data or not data.get("awb_no"):
+        _notify("❌ Extract Fail", f"{os.path.basename(pdf_path)} — manual fill karo")
+        return False
 
-        awb_display = data["awb_no"]
-        cfg         = get_origin_cfg(origin)
+    awb_display = data["awb_no"]
+    cfg         = get_origin_cfg(origin)
+    if save_to_extract(data, cfg["extract_sheet"]) == "error":
+        _notify("❌ Extract Save Fail", f"AWB {awb_display}")
+        return False
 
-        result = save_to_extract(data, cfg["extract_sheet"])
-        if result == "error":
-            _notify("❌ Extract Save Fail", f"AWB {awb_display}")
-            return
+    sheet_name = resolve_fy_sheet(origin, wb_daily)   # dynamic FY + fallback
+    ws_daily   = None
+    for sh in wb_daily.Sheets:
+        if sh.Name.strip().lower() == sheet_name.strip().lower():
+            ws_daily = sh; break
+    if ws_daily is None:
+        _notify("❌ Sheet Nahi Mila", f"AWB {awb_display} — '{sheet_name}'")
+        return False
 
-        import win32com.client
-        daily_name = os.path.basename(DAILY_PATH).lower()
-        try:
-            excel = win32com.client.GetActiveObject("Excel.Application")
-        except Exception:
-            excel = win32com.client.Dispatch("Excel.Application")
-            excel.Visible = False
-            opened_new    = True
-
-        excel.DisplayAlerts = False
-        excel.EnableEvents  = True
-
-        wb_daily = None
-        for wb in excel.Workbooks:
-            if os.path.basename(wb.FullName).lower() == daily_name:
-                wb_daily = wb; break
-        if wb_daily is None:
-            wb_daily = excel.Workbooks.Open(DAILY_PATH)
-
-        sheet_name = resolve_fy_sheet(origin, wb_daily)   # dynamic FY + fallback
-        ws_daily   = None
-        for sh in wb_daily.Sheets:
-            if sh.Name.strip().lower() == sheet_name.strip().lower():
-                ws_daily = sh; break
-
-        if ws_daily is None:
-            _notify("❌ Sheet Nahi Mila",
-                    f"AWB {awb_display} — '{sheet_name}'")
-            return
-
-        existing = _daily_existing_awbs(ws_daily)
-        if awb_display in existing:
-            move_to_processed(pdf_path, cfg["processed_folder"])
-            return
-
-        ws_daily.Activate()
-        target_row = _daily_next_empty(ws_daily)
-
-        rd = {
-            1 : data.get("awb_no",""),      2 : data.get("date",""),
-            3 : data.get("dest",""),         4 : data.get("flight",""),
-            5 : data.get("consignor",""),    6 : data.get("agent","") or agent,
-            7 : data.get("material",""),     8 : data.get("pcs",""),
-            9 : data.get("chargeable_wt",""),10: data.get("rate",""),
-            11: data.get("due_agent",""),    12: data.get("due_carrier",""),
-            13: data.get("commodity_item",""),  # col M → AF(CCU) / AG(BLR)
-        }
-
-        fill_fn = fill_daily_row_blr if origin == "BLR" else fill_daily_row
-        fill_fn(ws_daily, target_row, rd)
-        wb_daily.Save()
-        print(f"[AUTO-FILL] ✅ [{origin}] AWB {awb_display} → Row {target_row}")
-
+    if awb_display in _daily_existing_awbs(ws_daily):
         move_to_processed(pdf_path, cfg["processed_folder"])
-        memory_add_awb(awb_display, agent)
-        _notify(f"✔ Filed [{origin}]",
-                f"AWB {awb_display}  →  Row {target_row}   •   {agent}")
+        return False
 
+    ws_daily.Activate()
+    target_row = _daily_next_empty(ws_daily)
+    rd = {
+        1 : data.get("awb_no",""),      2 : data.get("date",""),
+        3 : data.get("dest",""),         4 : data.get("flight",""),
+        5 : data.get("consignor",""),    6 : data.get("agent","") or agent,
+        7 : data.get("material",""),     8 : data.get("pcs",""),
+        9 : data.get("chargeable_wt",""),10: data.get("rate",""),
+        11: data.get("due_agent",""),    12: data.get("due_carrier",""),
+        13: data.get("commodity_item",""),  # col M → AF(CCU) / AG(BLR)
+    }
+    fill_fn = fill_daily_row_blr if origin == "BLR" else fill_daily_row
+    fill_fn(ws_daily, target_row, rd)
+    print(f"[AUTO-FILL] ✅ [{origin}] AWB {awb_display} → Row {target_row}")
+
+    move_to_processed(pdf_path, cfg["processed_folder"])
+    memory_add_awb(awb_display, agent)
+    _notify(f"✔ Filed [{origin}]",
+            f"AWB {awb_display}  →  Row {target_row}   •   {agent}")
+    return True
+
+def _process_fill_batch(batch):
+    """
+    Ek burst ke saare AWBs EK hi workbook open/close cycle mein fill karo.
+    Non-locking policy (_open_daily_workbook / _finish_daily_workbook):
+      • File pehle se user ke Excel mein khuli → attach + save, band NAHI.
+      • File closed → background open, fill, save, turant CLOSE → lock release.
+    """
+    if not batch:
+        return
+    excel = wb_daily = None
+    ctx   = {"attached": False, "opened_wb": False, "opened_app": False}
+    try:
+        excel, wb_daily, ctx = _open_daily_workbook(visible_if_new=False)
+
+        # File kisi aur process ne lock kar rakhi ho → read-only khuli → abort
+        if not ctx.get("attached") and getattr(wb_daily, "ReadOnly", False):
+            _notify("⚠ Excel Locked",
+                    "Daily sheet kisi aur process ne read-only lock ki hai. "
+                    "Band karke dobara try hoga.")
+            _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=False)
+            # Batch wapas queue mein daal do (baad mein retry)
+            for item in batch:
+                _auto_fill_queue.put(item)
+            time.sleep(5)
+            return
+
+        wrote = 0
+        for pdf_path, origin, agent in batch:
+            try:
+                if _fill_one_awb(excel, wb_daily, pdf_path, origin, agent):
+                    wrote += 1
+            except Exception as e:
+                print(f"[AUTO-FILL] item error: {e}")
+                _notify("❌ Auto Fill Error", str(e)[:80])
+        print(f"[AUTO-FILL] Batch done — {wrote}/{len(batch)} rows written.")
+        _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=(wrote > 0))
     except Exception as e:
-        print(f"[AUTO-FILL ERROR] {e}")
-        _notify("❌ Auto Fill Error",
-                f"AWB {awb_display or '?'} — {str(e)[:60]}")
+        print(f"[AUTO-FILL BATCH ERROR] {e}")
+        _notify("❌ Auto Fill Error", str(e)[:80])
+        # Kuch bhi galat ho to bhi lock na phanse — band karne ki koshish
+        try: _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=False)
+        except Exception: pass
     finally:
-        # COM init/uninit worker loop ke zimme hai — yahan sirf Excel state restore
-        try:
-            if excel: excel.DisplayAlerts = True
-            if opened_new and excel:
-                try:
-                    if excel.Workbooks.Count == 0: excel.Quit()
-                except Exception: pass
+        # CALLER-side COM refs bhi drop karo — warna excel.exe zinda rehta hai
+        # (del function ke andar sirf uske local ko free karta hai). Yahan null
+        # karke gc chala do → orphan process guaranteed gaya.
+        excel = wb_daily = None
+        try: gc.collect()
         except Exception: pass
 
 # ─── PHASE 2: EXTRACT ─────────────────────────────────────────────────────────
@@ -1858,32 +1873,139 @@ def _do_fill_phase(origin: str, excel, wb_daily) -> tuple:
 
     return added, failed
 
-# ── PATCH 20: _get_or_open_excel — Excel open/reuse common logic ──────────────
-def _get_or_open_excel():
-    """Existing Excel instance reuse karo ya naya open karo."""
-    import win32com.client
+# ── Ownership-aware, non-locking Excel helpers ────────────────────────────────
+def _find_open_daily(excel):
+    """Diye Excel app mein already-open daily workbook return karo, warna None."""
     daily_name = os.path.basename(DAILY_PATH).lower()
     try:
-        excel = win32com.client.GetActiveObject("Excel.Application")
-        print("  [EXCEL] Existing instance mila.")
+        for wb in excel.Workbooks:
+            try:
+                if os.path.basename(wb.FullName).lower() == daily_name:
+                    return wb
+            except Exception:
+                continue
     except Exception:
+        pass
+    return None
+
+def _open_daily_workbook(visible_if_new: bool = False):
+    """
+    Non-locking daily-workbook opener. Return: (excel, wb_daily, ctx)
+        ctx = {"attached": bool, "opened_wb": bool, "opened_app": bool}
+
+    • attached=True  → workbook pehle se kisi running Excel mein khuli thi.
+                       Us instance se attach. Save karo, band MAT karo → user
+                       lockout nahi hota.
+    • opened_wb=True → humne (background) kholi. Likho, save, phir
+                       _finish_daily_workbook() se band → file lock turant release.
+    """
+    import win32com.client
+    excel      = None
+    opened_app = False
+
+    # 1) Running Excel se attach try karo (user ki instance)
+    try:
+        excel = win32com.client.GetActiveObject("Excel.Application")
+        print("  [EXCEL] Running instance mila — attach.")
+    except Exception:
+        excel = None
+
+    # 2) Koi running instance nahi → naya banao (default hidden — no flashing)
+    if excel is None:
         excel = win32com.client.Dispatch("Excel.Application")
-        excel.Visible = True
-        print("  [EXCEL] Naya instance khola.")
+        excel.Visible = bool(visible_if_new)
+        opened_app    = True
+        print(f"  [EXCEL] Naya instance khola (visible={bool(visible_if_new)}).")
 
     excel.DisplayAlerts = False
     excel.EnableEvents  = True
 
-    wb_daily = None
-    for wb in excel.Workbooks:
-        if os.path.basename(wb.FullName).lower() == daily_name:
-            wb_daily = wb
-            print("  [EXCEL] DAILYSHEET already open — reuse.")
-            break
-    if wb_daily is None:
-        wb_daily = excel.Workbooks.Open(DAILY_PATH)
-        print("  [EXCEL] DAILYSHEET naya open kiya.")
+    # 3) Daily book already open hai?
+    wb_daily = _find_open_daily(excel)
+    if wb_daily is not None:
+        print("  [EXCEL] Daily sheet ALREADY OPEN — attach mode (no lock).")
+        return excel, wb_daily, {"attached": True, "opened_wb": False,
+                                 "opened_app": opened_app}
 
+    # 4) Nahi khuli → hum kholte hain (write ke baad band hogi)
+    wb_daily = excel.Workbooks.Open(DAILY_PATH)
+    print("  [EXCEL] Daily sheet background open kiya.")
+    return excel, wb_daily, {"attached": False, "opened_wb": True,
+                             "opened_app": opened_app}
+
+def _finish_daily_workbook(excel, wb_daily, ctx, keep_open: bool = False,
+                           save: bool = True):
+    """
+    Ownership ke hisaab se cleanup:
+      • attached (user ki book)      → sirf Save, band mat karo (lockout na ho).
+      • keep_open=True (manual fill) → Save + visible chhod do.
+      • humne kholi (opened_wb/opened_app) + keep_open=False
+                                     → wb.Close(SaveChanges=True) + excel.Quit()
+                                       UNCONDITIONALLY + del refs + gc.collect()
+                                       taaki orphan excel.exe na bache aur file
+                                       lock TURANT release ho.
+    """
+    # ── Case A: user ki apni book → sirf save, kuch band nahi ─────────────────
+    if ctx.get("attached"):
+        try:
+            if save and wb_daily is not None:
+                wb_daily.Save()
+        except Exception as e:
+            print(f"[EXCEL] attached save error: {e}")
+        try:
+            if excel is not None:
+                excel.DisplayAlerts = True
+        except Exception: pass
+        return
+
+    # ── Case B: manual fill → save + visible, khula rehne do ─────────────────
+    if keep_open:
+        try:
+            if save and wb_daily is not None:
+                wb_daily.Save()
+        except Exception as e:
+            print(f"[EXCEL] keep-open save error: {e}")
+        try:
+            if excel is not None:
+                excel.DisplayAlerts = True
+                if ctx.get("opened_app"):
+                    excel.Visible = True
+        except Exception: pass
+        return
+
+    # ── Case C: HUMNE background mein kholi → STRICT teardown ─────────────────
+    # Yahi woh path hai jahan pehle orphan excel.exe bacha rehta tha.
+    # Fix: Close + Quit UNCONDITIONAL (Workbooks.Count guard hata diya — kyunki
+    # PERSONAL.XLSB / add-ins Count ko kabhi 0 nahi hone dete the), phir del + gc.
+    try:
+        if wb_daily is not None:
+            try:
+                wb_daily.Close(SaveChanges=bool(save))
+            except Exception as e:
+                print(f"[EXCEL] close error: {e}")
+
+        if excel is not None:
+            try:
+                excel.DisplayAlerts = True
+            except Exception: pass
+            try:
+                excel.Quit()          # ← ALWAYS quit (no Count guard)
+            except Exception as e:
+                print(f"[EXCEL] quit error: {e}")
+    finally:
+        # COM references explicitly drop karo — Windows file lock isi par release
+        # hota hai. Local names delete + gc taaki pywin32 ka wrapper turant free ho.
+        try: del wb_daily
+        except Exception: pass
+        try: del excel
+        except Exception: pass
+        try:
+            gc.collect()
+        except Exception: pass
+
+# Backward-compat shim — purane callers ke liye (attach/open, keep open)
+def _get_or_open_excel():
+    excel, wb_daily, _ctx = _open_daily_workbook(visible_if_new=True)
     return excel, wb_daily
 
 # ── PATCH 21: run_daily_fill — origin param se CCU ya BLR fill ────────────────
@@ -1904,19 +2026,28 @@ def run_daily_fill(origin: str = "CCU"):
         return
 
     excel = wb_daily = None
+    ctx   = {"attached": False, "opened_wb": False, "opened_app": False}
     try:
-        excel, wb_daily = _get_or_open_excel()
+        excel, wb_daily, ctx = _open_daily_workbook(visible_if_new=True)
+
+        if not ctx.get("attached") and getattr(wb_daily, "ReadOnly", False):
+            _popup("warn", "Excel Locked",
+                   f"[{origin}] Daily sheet read-only lock hai. Excel band karke retry karo.")
+            _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=False)
+            return
 
         added, failed = _do_fill_phase(origin, excel, wb_daily)
 
         if not added and not failed:
             _popup("info", "Kuch Nahi",
                    f"[{origin}] Koi naya AWB fill karne ke liye nahi mila.")
-            wb_daily.Close(SaveChanges=False)
+            # Kuch nahi likha → agar humne kholi thi to band, user ki thi to rehne do
+            _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=False)
             return
 
-        wb_daily.Save()
         print(f"\n[DONE] [{origin}] Added:{len(added)}  Failed:{len(failed)}")
+        # Manual fill — user ko sheet dikhni chahiye → keep_open
+        _finish_daily_workbook(excel, wb_daily, ctx, keep_open=True, save=True)
 
         summary = (f"[{origin}] ✅  {len(added)} AWB(s) fill hue\n"
                    f"❌  {len(failed)} fail hue")
@@ -1926,10 +2057,9 @@ def run_daily_fill(origin: str = "CCU"):
     except Exception as e:
         print(f"[{origin} DAILY ERROR] {e}")
         _popup("error", "Error", f"[{origin}] Daily fill error:\n{e}")
-    finally:
-        try:
-            if excel: excel.DisplayAlerts = True
+        try: _finish_daily_workbook(excel, wb_daily, ctx, keep_open=True, save=False)
         except Exception: pass
+    finally:
         try: pythoncom.CoUninitialize()
         except Exception: pass
 
@@ -1947,8 +2077,15 @@ def run_both_fill():
     print(f"\n[BOTH] Extract done — CCU:{ccu_ext}  BLR:{blr_ext}")
 
     excel = wb_daily = None
+    ctx   = {"attached": False, "opened_wb": False, "opened_app": False}
     try:
-        excel, wb_daily = _get_or_open_excel()
+        excel, wb_daily, ctx = _open_daily_workbook(visible_if_new=True)
+
+        if not ctx.get("attached") and getattr(wb_daily, "ReadOnly", False):
+            _popup("warn", "Excel Locked",
+                   "Daily sheet read-only lock hai. Excel band karke retry karo.")
+            _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=False)
+            return
 
         # CCU fill pehle
         print("\n[BOTH] CCU fill shuru...")
@@ -1958,9 +2095,9 @@ def run_both_fill():
         print("\n[BOTH] BLR fill shuru...")
         blr_added, blr_failed = _do_fill_phase("BLR", excel, wb_daily)
 
-        wb_daily.Save()
         print(f"\n[BOTH DONE] CCU Added:{len(ccu_added)} Failed:{len(ccu_failed)} | "
               f"BLR Added:{len(blr_added)} Failed:{len(blr_failed)}")
+        _finish_daily_workbook(excel, wb_daily, ctx, keep_open=True, save=True)
 
         summary = (
             f"✅ CCU: {len(ccu_added)} fill hue  ❌ {len(ccu_failed)} fail\n"
@@ -1973,10 +2110,9 @@ def run_both_fill():
     except Exception as e:
         print(f"[BOTH FILL ERROR] {e}")
         _popup("error", "Error", f"Fill Both error:\n{e}")
-    finally:
-        try:
-            if excel: excel.DisplayAlerts = True
+        try: _finish_daily_workbook(excel, wb_daily, ctx, keep_open=True, save=False)
         except Exception: pass
+    finally:
         try: pythoncom.CoUninitialize()
         except Exception: pass
 
