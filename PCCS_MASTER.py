@@ -1371,6 +1371,7 @@ def _auto_fill_worker_loop():
             except Exception as e:
                 print(f"[AUTO-FILL WORKER] {e}")
                 _notify("❌ Auto Fill Error", str(e)[:80])
+                TRAY.error()
             finally:
                 for _ in batch:
                     try: _auto_fill_queue.task_done()
@@ -1427,8 +1428,9 @@ def _fill_one_awb(excel, wb_daily, pdf_path: str, origin: str, agent: str) -> bo
 
     move_to_processed(pdf_path, cfg["processed_folder"])
     memory_add_awb(awb_display, agent)
-    _notify(f"✔ Filed [{origin}]",
-            f"AWB {awb_display}  →  Row {target_row}   •   {agent}")
+    # Toast ki jagah seamless tray status: live count badhao (checkmark batch end pe)
+    print(f"[AUTO-FILL] ✔ Filed [{origin}] AWB {awb_display} → Row {target_row} • {agent}")
+    TRAY.bump()
     return True
 
 def _process_fill_batch(batch):
@@ -1440,6 +1442,7 @@ def _process_fill_batch(batch):
     """
     if not batch:
         return
+    TRAY.processing()          # PDF aaya → tray spinner ON (seamless, no toast)
     excel = wb_daily = None
     ctx   = {"attached": False, "opened_wb": False, "opened_app": False}
     try:
@@ -1454,6 +1457,7 @@ def _process_fill_batch(batch):
             # Batch wapas queue mein daal do (baad mein retry)
             for item in batch:
                 _auto_fill_queue.put(item)
+            TRAY.idle()        # spinner off — retry hone tak idle
             time.sleep(5)
             return
 
@@ -1467,9 +1471,12 @@ def _process_fill_batch(batch):
                 _notify("❌ Auto Fill Error", str(e)[:80])
         print(f"[AUTO-FILL] Batch done — {wrote}/{len(batch)} rows written.")
         _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=(wrote > 0))
+        # Seamless finish: kuch fill hua → animated green check, warna chup-chaap idle
+        TRAY.celebrate() if wrote > 0 else TRAY.idle()
     except Exception as e:
         print(f"[AUTO-FILL BATCH ERROR] {e}")
         _notify("❌ Auto Fill Error", str(e)[:80])
+        TRAY.error()       # tray pe pulsing red X flash
         # Kuch bhi galat ho to bhi lock na phanse — band karne ki koshish
         try: _finish_daily_workbook(excel, wb_daily, ctx, keep_open=False, save=False)
         except Exception: pass
@@ -2247,16 +2254,233 @@ def process_folder_only():
         try: pythoncom.CoUninitialize()
         except Exception: pass
 
-# ─── SYSTEM TRAY ──────────────────────────────────────────────────────────────
+# ─── SYSTEM TRAY — DYNAMIC VISUAL STATUS ENGINE ───────────────────────────────
+# Ek hi animator thread SAARA icon update karta hai → koi race nahi. Idle pe
+# thread Event pe blocked → CPU zero. Frames pehle se render hote hain → taskbar
+# smooth, no lag, no crash. States: idle → processing → success/error → idle.
+
+_SZ        = 64
+_TRAY_BG   = "#1C1F2E"
+_PLANE_HI  = "#5C96FF"
+_PLANE_LO  = "#3D7EFF"
+_PLANE_DHI = "#2E63C8"        # dim plane (processing ke waqt arc pop kare)
+_PLANE_DLO = "#244E9E"
+_SPIN_CLR  = (77, 163, 255, 255)     # bright blue comet arc
+_SPIN_HEAD = (230, 240, 255, 255)    # glowing head dot
+_OK_CLR    = (46, 213, 115, 255)     # green
+_OK_DIM    = (28, 140, 76, 255)
+_ERR_CLR   = (255, 71, 87, 255)      # red
+_ERR_DIM   = (150, 40, 52, 255)
+
+def _new_canvas():
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (_SZ, _SZ), (0, 0, 0, 0))
+    return img, ImageDraw.Draw(img)
+
+def _draw_disc(d, ring=None, ring_w=4):
+    d.ellipse([0, 0, _SZ - 1, _SZ - 1], fill=_TRAY_BG)
+    if ring:
+        d.ellipse([2, 2, _SZ - 3, _SZ - 3], outline=ring, width=ring_w)
+
+def _draw_plane(d, hi=_PLANE_HI, lo=_PLANE_LO):
+    d.polygon([(32, 8), (20, 40), (32, 34), (44, 40)], fill=lo)
+    d.polygon([(12, 32), (32, 26), (52, 32), (32, 36)], fill=hi)
+
+def _draw_check(d, p, color=_OK_CLR, w=6):
+    """Progress p∈[0,1] tak checkmark stroke draw karo (round joints)."""
+    import math
+    pts  = [(16, 34), (28, 45), (47, 19)]
+    segs = [(pts[0], pts[1]), (pts[1], pts[2])]
+    lens = [math.dist(a, b) for a, b in segs]
+    target, acc, drawn = p * sum(lens), 0.0, [pts[0]]
+    for (a, b), L in zip(segs, lens):
+        if target >= acc + L:
+            drawn.append(b); acc += L
+        else:
+            t = (target - acc) / L if L else 0
+            drawn.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+            break
+    if len(drawn) >= 2:
+        d.line(drawn, fill=color, width=w, joint="curve")
+        for x, y in drawn:                       # round the ends/joints
+            d.ellipse([x - w/2, y - w/2, x + w/2, y + w/2], fill=color)
+
+def _draw_x(d, color, w=6):
+    d.line([(21, 21), (43, 43)], fill=color, width=w)
+    d.line([(43, 21), (21, 43)], fill=color, width=w)
+
+def _base_idle():
+    img, d = _new_canvas()
+    _draw_disc(d)
+    _draw_plane(d)
+    return img
+
+def _spin_frames(n=12):
+    """Rotating comet: bright 100° arc + glowing head dot, dim plane peeche."""
+    import math
+    frames, sweep, R, c = [], 100, 27, 32
+    for i in range(n):
+        img, d = _new_canvas()
+        _draw_disc(d)
+        _draw_plane(d, hi=_PLANE_DHI, lo=_PLANE_DLO)
+        start = (i * 360.0 / n) % 360
+        d.arc([c - R, c - R, c + R, c + R], start, start + sweep,
+              fill=_SPIN_CLR, width=5)
+        ang = math.radians(start + sweep)
+        hx, hy = c + R * math.cos(ang), c + R * math.sin(ang)
+        d.ellipse([hx - 4, hy - 4, hx + 4, hy + 4], fill=_SPIN_HEAD)
+        frames.append(img)
+    return frames
+
+def _success_frames():
+    """Green ring + hand-drawn checkmark reveal, phir 2 settle frames."""
+    frames, N = [], 8
+    for i in range(N):
+        img, d = _new_canvas()
+        _draw_disc(d, ring=_OK_CLR, ring_w=4)
+        _draw_check(d, (i + 1) / N)
+        frames.append(img)
+    for _ in range(2):                           # hold full check briefly
+        img, d = _new_canvas()
+        _draw_disc(d, ring=_OK_CLR, ring_w=5)
+        _draw_check(d, 1.0)
+        frames.append(img)
+    return frames
+
+def _error_frames():
+    """Pulsing red ring + X (bright/dim flash)."""
+    frames = []
+    for i in range(6):
+        col = _ERR_CLR if i % 2 == 0 else _ERR_DIM
+        img, d = _new_canvas()
+        _draw_disc(d, ring=col, ring_w=4)
+        _draw_x(d, col)
+        frames.append(img)
+    return frames
+
+def _build_frames():
+    return {
+        "idle":    _base_idle(),
+        "spin":    _spin_frames(12),
+        "success": _success_frames(),
+        "error":   _error_frames(),
+    }
+
+def _today_str():
+    return time.strftime("%Y-%m-%d")
+
+
+class TrayStatus:
+    """
+    Single-thread animator state machine. Thread-safe: koi bhi background thread
+    processing()/celebrate()/error()/bump() safely call kar sakta hai.
+    """
+    IDLE, PROCESSING, SUCCESS, ERROR = "idle", "processing", "success", "error"
+
+    def __init__(self):
+        self._icon   = None
+        self._frames = None
+        self._state  = self.IDLE
+        self._lock   = threading.Lock()
+        self._wake   = threading.Event()
+        self._count  = 0
+        self._date   = _today_str()
+
+    # ── lifecycle ────────────────────────────────────────────────────────────
+    def attach(self, icon):
+        """build_tray() se call — frames render + animator thread start."""
+        self._icon   = icon
+        self._frames = _build_frames()
+        self._apply(self._frames["idle"], self._tooltip())
+        threading.Thread(target=self._run, daemon=True,
+                         name="tray-animator").start()
+
+    # ── public state triggers ────────────────────────────────────────────────
+    def processing(self):
+        self._set(self.PROCESSING)
+
+    def idle(self):
+        self._set(self.IDLE)
+
+    def celebrate(self):
+        """Success checkmark play karo, phir apne aap idle."""
+        self._set(self.SUCCESS)
+
+    def error(self):
+        self._set(self.ERROR)
+
+    def bump(self, n=1):
+        """Auto-filled count +n (live tooltip). Animation state chhedta nahi."""
+        with self._lock:
+            if _today_str() != self._date:       # naya din → reset
+                self._date, self._count = _today_str(), 0
+            self._count += n
+
+    # ── internals ────────────────────────────────────────────────────────────
+    def _set(self, state):
+        with self._lock:
+            self._state = state
+        self._wake.set()
+
+    def _tooltip(self):
+        return f"✈ PCCS AWB System\n✔ Auto-filled today: {self._count}"
+
+    def _apply(self, img, title=None):
+        try:
+            if self._icon is None:
+                return
+            self._icon.icon = img
+            if title is not None:
+                self._icon.title = title
+        except Exception:
+            pass                                  # tray crash kabhi na aaye
+
+    def _run(self):
+        spin_i, FPS = 0, 10
+        while True:
+            with self._lock:
+                st = self._state
+
+            if st == self.IDLE:
+                self._apply(self._frames["idle"], self._tooltip())
+                self._wake.wait()                 # fully sleep — 0% CPU
+                self._wake.clear()
+
+            elif st == self.PROCESSING:
+                frames = self._frames["spin"]
+                self._apply(frames[spin_i % len(frames)], self._tooltip())
+                spin_i += 1
+                if self._wake.wait(1.0 / FPS):    # state changed → re-loop
+                    self._wake.clear()
+
+            elif st == self.SUCCESS:
+                for img in self._frames["success"]:
+                    with self._lock:
+                        if self._state != self.SUCCESS:
+                            break
+                    self._apply(img, self._tooltip())
+                    time.sleep(1 / 15)
+                with self._lock:
+                    if self._state == self.SUCCESS:
+                        self._state = self.IDLE
+
+            elif st == self.ERROR:
+                for img in self._frames["error"]:
+                    with self._lock:
+                        if self._state != self.ERROR:
+                            break
+                    self._apply(img, self._tooltip())
+                    time.sleep(1 / 8)
+                with self._lock:
+                    if self._state == self.ERROR:
+                        self._state = self.IDLE
+
+
+TRAY = TrayStatus()          # global — worker threads isse update karte hain
 
 def make_tray_icon():
-    from PIL import Image, ImageDraw
-    img = Image.new("RGBA",(64,64),(0,0,0,0))
-    d   = ImageDraw.Draw(img)
-    d.ellipse([0,0,63,63], fill="#1C1F2E")
-    d.polygon([(32,8),(20,40),(32,34),(44,40)], fill="#3D7EFF")
-    d.polygon([(12,32),(32,26),(52,32),(32,36)], fill="#5C96FF")
-    return img
+    """Initial idle image (pystray.Icon ko pass hota hai)."""
+    return _base_idle()
 
 # ── PATCH 24: build_tray — updated menu with CCU/BLR/Both ────────────────────
 def build_tray():
@@ -2309,9 +2533,10 @@ def build_tray():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("❌ Exit",                 on_exit),
     )
-    icon = pystray.Icon("PCCS", make_tray_icon(), "PCCS AWB System", menu)
+    icon = pystray.Icon("PCCS", make_tray_icon(), "✈ PCCS AWB System", menu)
     global _tray_icon_ref
     _tray_icon_ref = icon   # _notify() ke liye globally accessible
+    TRAY.attach(icon)       # dynamic visual status engine start
     return icon
 
 # ─── FIRST RUN SETUP WIZARD ───────────────────────────────────────────────────
